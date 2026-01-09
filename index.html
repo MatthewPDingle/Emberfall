@@ -1549,20 +1549,26 @@
                 // Check if clicking on a unit
                 const clickedUnit = this.units.find(u => u.q === hex.q && u.r === hex.r);
 
+                // If ability is selected, check for valid ability target FIRST
+                if (this.selectedUnit && this.selectedAbility) {
+                    const abilityTarget = this.abilityTargets.find(t => t.q === hex.q && t.r === hex.r);
+                    if (abilityTarget) {
+                        this.useAbility(this.selectedAbility, abilityTarget);
+                        return;
+                    } else {
+                        // Invalid ability target - show feedback and cancel
+                        this.addLogEntry('Invalid target for ability', 'info');
+                        this.selectedAbility = null;
+                        this.abilityTargets = [];
+                        return;
+                    }
+                }
+
                 if (clickedUnit && clickedUnit.team === 'player' && !clickedUnit.moved && !clickedUnit.attacked) {
                     // Select unit
                     this.selectUnit(clickedUnit);
                     playSound('select');
                 } else if (this.selectedUnit) {
-                    // Check for ability target first (if ability is selected)
-                    if (this.selectedAbility) {
-                        const abilityTarget = this.abilityTargets.find(t => t.q === hex.q && t.r === hex.r);
-                        if (abilityTarget) {
-                            this.useAbility(this.selectedAbility, abilityTarget);
-                            return;
-                        }
-                    }
-
                     // Check for valid move
                     const moveTarget = this.validMoves.find(m => m.q === hex.q && m.r === hex.r);
                     if (moveTarget) {
@@ -1734,12 +1740,28 @@
                 playSound('attack');
                 this.isAnimating = true;
 
-                // Calculate damage
+                // Calculate damage with buff support
                 const hex = this.hexMap.get(`${defender.q},${defender.r}`);
                 const terrainDefense = hex ? hex.terrain.defenseBonus : 0;
-                const totalDefense = defender.defense + terrainDefense;
 
-                let damage = Math.max(1, attacker.attack - totalDefense * 0.5);
+                // Apply attack buffs
+                let attackPower = attacker.attack;
+                if (attacker.buffs) {
+                    attacker.buffs.forEach(buff => {
+                        if (buff.type === 'attack') attackPower *= buff.value;
+                    });
+                }
+
+                // Apply defense buffs
+                let defenseValue = defender.defense;
+                if (defender.buffs) {
+                    defender.buffs.forEach(buff => {
+                        if (buff.type === 'defense') defenseValue *= buff.value;
+                    });
+                }
+                const totalDefense = defenseValue + terrainDefense;
+
+                let damage = Math.max(1, attackPower - totalDefense * 0.5);
                 damage = Math.floor(damage * (0.9 + Math.random() * 0.2)); // Variance
 
                 defender.currentHealth -= damage;
@@ -1826,10 +1848,18 @@
                 this.units.filter(u => u.team === 'player').forEach(u => {
                     u.moved = false;
                     u.attacked = false;
+                    u.stunned = false; // Clear stun at turn start
                     // Reduce cooldowns
                     Object.keys(u.cooldowns).forEach(k => {
                         if (u.cooldowns[k] > 0) u.cooldowns[k]--;
                     });
+                    // Reduce buff durations and remove expired buffs
+                    if (u.buffs) {
+                        u.buffs = u.buffs.filter(buff => {
+                            buff.turns--;
+                            return buff.turns > 0;
+                        });
+                    }
                 });
 
                 this.currentTurn = 'enemy';
@@ -1847,6 +1877,12 @@
                 for (const enemy of enemies) {
                     if (this.units.filter(u => u.team === 'player').length === 0) break;
 
+                    // Skip stunned enemies
+                    if (enemy.stunned) {
+                        this.addLogEntry(`${enemy.name} is stunned!`, 'special');
+                        continue;
+                    }
+
                     await this.executeEnemyAI(enemy);
                     await this.sleep(300);
                 }
@@ -1855,6 +1891,14 @@
                 enemies.forEach(u => {
                     u.moved = false;
                     u.attacked = false;
+                    u.stunned = false; // Clear stun after their turn
+                    // Reduce buff durations and remove expired buffs
+                    if (u.buffs) {
+                        u.buffs = u.buffs.filter(buff => {
+                            buff.turns--;
+                            return buff.turns > 0;
+                        });
+                    }
                 });
 
                 this.currentTurn = 'player';
@@ -2174,15 +2218,34 @@
                     if (targetUnit) {
                         playSound('attack');
 
-                        let damage = unit.attack * (ability.damage || 1);
+                        // Apply attack buffs
+                        let attackPower = unit.attack;
+                        if (unit.buffs) {
+                            unit.buffs.forEach(buff => {
+                                if (buff.type === 'attack') attackPower *= buff.value;
+                            });
+                        }
+
+                        let damage = attackPower * (ability.damage || 1);
+
+                        // Apply defense buffs
+                        let defenseValue = targetUnit.defense;
+                        if (targetUnit.buffs) {
+                            targetUnit.buffs.forEach(buff => {
+                                if (buff.type === 'defense') defenseValue *= buff.value;
+                            });
+                        }
 
                         // Special ability effects
                         if (abilityKey === 'piercing_shot') {
-                            damage = unit.attack * ability.damage; // Ignores defense
+                            // Piercing Shot ignores 50% of defense
+                            const hex = this.hexMap.get(`${targetUnit.q},${targetUnit.r}`);
+                            const terrainDefense = hex ? hex.terrain.defenseBonus : 0;
+                            damage = Math.max(1, damage - (defenseValue + terrainDefense) * 0.25);
                         } else {
                             const hex = this.hexMap.get(`${targetUnit.q},${targetUnit.r}`);
                             const terrainDefense = hex ? hex.terrain.defenseBonus : 0;
-                            damage = Math.max(1, damage - (targetUnit.defense + terrainDefense) * 0.5);
+                            damage = Math.max(1, damage - (defenseValue + terrainDefense) * 0.5);
                         }
 
                         damage = Math.floor(damage * (0.9 + Math.random() * 0.2));
@@ -2192,6 +2255,28 @@
                         this.createDamageNumber(targetUnit, damage, 'damage');
                         this.createAttackParticles(unit, targetUnit);
                         this.addLogEntry(`${unit.name} uses ${ability.name} for ${damage} damage`, 'damage');
+
+                        // Shield Bash - stun the target
+                        if (abilityKey === 'shield_bash') {
+                            targetUnit.stunned = true;
+                            this.addLogEntry(`${targetUnit.name} is stunned!`, 'special');
+                        }
+
+                        // Charge - move to adjacent hex of target
+                        if (abilityKey === 'charge') {
+                            const neighbors = HexUtils.neighbors(targetUnit.q, targetUnit.r);
+                            // Find an empty adjacent hex
+                            for (const n of neighbors) {
+                                const occupied = this.units.some(u => u.q === n.q && u.r === n.r);
+                                const hex = this.hexMap.get(`${n.q},${n.r}`);
+                                if (!occupied && hex && hex.terrain.movementCost < 99) {
+                                    unit.q = n.q;
+                                    unit.r = n.r;
+                                    this.addLogEntry(`${unit.name} charges forward!`, 'special');
+                                    break;
+                                }
+                            }
+                        }
 
                         // Check death
                         if (targetUnit.currentHealth <= 0) {
